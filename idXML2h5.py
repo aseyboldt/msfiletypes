@@ -1,17 +1,22 @@
 import xml.etree.ElementTree as ET
 import tables as tb
-from scipy import sparse
 import argparse
 import contextlib
+import numpy as np
 
 
 class Proteins(tb.IsDescription):
+    """ Corresponds to a ProteinHit in idXML. Does not store UserParams """
     id = tb.Int64Col(pos=0)
     accession = tb.StringCol(200, pos=1)
     score = tb.Float64Col(pos=2)
 
 
 class PeptideHits(tb.IsDescription):
+    """ Corresponds to PeptideHit in idXML.
+
+    Peptide hits that share the same PeptideIdentification section (they
+    could explain the same spectrum) share their pos_id"""
     pos_id = tb.Int64Col(pos=0)
     mz = tb.Float64Col(pos=1)
     rt = tb.Float64Col(pos=2)
@@ -23,15 +28,97 @@ class PeptideHits(tb.IsDescription):
     e_value = tb.Float64Col(pos=8)
 
 
-def write_run(search_params, ident_run, hdf_file, where="/", filters=None):
+def write_proteins(iterparser, start_tag, table):
+
+    def read_protein_hit(elem, buffer):
+        buffer['accession'] = elem.get('accession')
+        buffer['score'] = float(elem.get('score'))
+        buffer['id'] = prot_count
+
+    buffer_size = 1024
+    buffer_array = np.empty((buffer_size, ), table.dtype)
+
+    prot_count = 0
+    buffer_index = 0
+    for event, elem in iterparser:
+        if event == 'start':
+            continue
+        if elem.tag == 'ProteinIdentification':
+            table.append(buffer_array[:buffer_index])
+            start_tag.clear()
+            return
+        elif elem.tag == 'ProteinHit':
+            read_protein_hit(elem, buffer_array[buffer_index])
+            buffer_index += 1
+            if buffer_index == buffer_size:
+                table.append(buffer_array)
+                buffer_index = 0
+            prot_count += 1
+            start_tag.clear()
+        elif elem.tag == 'UserParam':
+            pass
+        else:
+            raise ValueError('Got unexpected xml tag: %s' % elem.tag)
+
+
+def write_peptides(iterparser, start_elem, peptide_hits, indptr, indices):
+
+    def read_peptide_ident(elem, pos_id):
+        assert elem.tag == 'PeptideIdentification'
+        mz = float(elem.get('MZ'))
+        rt = float(elem.get('RT'))
+        protein_refs = []
+        rows = []
+        for peptide_hit in elem.findall('PeptideHit'):
+            seq = peptide_hit.get('sequence')
+            charge = int(peptide_hit.get('charge'))
+            score = float(peptide_hit.get('score'))
+            aa_before = peptide_hit.get('aa_before')
+            aa_after = peptide_hit.get('aa_after')
+            e_value_elem = [
+                el for el in peptide_hit
+                if el.get('name') == 'E-Value'
+            ]
+            if len(e_value_elem) > 0:
+                assert len(e_value_elem) == 1
+                e_value = float(e_value_elem[0].get('value'))
+            else:
+                e_value = float('nan')
+            prot_refs = peptide_hit.get('protein_refs').split(' ')
+            protein_refs.append([int(ref[3:]) for ref in prot_refs])
+            rows.append((pos_id, mz, rt, charge, score, seq, aa_before,
+                         aa_after, e_value))
+        return rows, protein_refs
+
+    pos_id = 0
+    for event, elem in iterparser:
+        if event == 'start':
+            continue
+        if elem.tag == 'PeptideIdentification':
+            rows, idxs = read_peptide_ident(elem, pos_id)
+            start_elem.clear()
+            peptide_hits.append(rows)
+            for idx in idxs:
+                indptr.append([len(indices)])
+                indices.append(idx)
+            pos_id += 1
+            start_elem.clear()
+        if elem.tag == 'IdentificationRun':
+            indptr.append([len(indices)])
+            start_elem.clear()
+            return
+
+
+def write_run(iterparser, start_tag, hdf_file, where="/", filters=None):
     """ Store the data from one identification run in a hdf5 group.
 
     Parameters
     ----------
-    search_params: ElementTree.Element
-        A 'SearchParameters' section of idXML
-    ident_run: ElementTree.Element
-        The corresponding 'IdentificationRun' section.
+    search_params: iterator like ElementTree.iterparse
+        This must be in a state after ('start', 'IdentificationRun') has been
+        called.
+    start_tag: ElementTree.Element
+        The start tag element of IdentificationRun
     hdf_file: tables.File
         Opened HDF5 file from pyTables
     where: str or group
@@ -39,58 +126,34 @@ def write_run(search_params, ident_run, hdf_file, where="/", filters=None):
     filters: tables.Filter
         Filters to use in HDF5. See tables.Filter
     """
-    if not search_params.tag == 'SearchParameters':
-        raise ValueError('Not a SearchParameters tag: %s' % search_params)
-    if not ident_run.tag == 'IdentificationRun':
-        raise ValueError('Not a IdentificationRun tag: %s' % ident_run)
+    if not start_tag.tag == 'IdentificationRun':
+        raise ValueError('Not a IdentificationRun tag: %s' % start_tag.tag)
 
     proteins = hdf_file.create_table(
         where, 'proteins', description=Proteins, filters=filters
     )
 
-    prot_ident_el = ident_run.find('ProteinIdentification')
-    assert prot_ident_el is not None
-    for i, prot in enumerate(prot_ident_el.findall('ProteinHit')):
-        prot_id = i
-        accession = prot.get('accession')
-        score = float(prot.get('score'))
-        proteins.append([(prot_id, accession, score)])
-
     peptide_hits = hdf_file.create_table(
         where, 'peptide_hits', filters=filters, description=PeptideHits
     )
 
-    hit_to_prot = set()
+    indptr = hdf_file.create_earray(
+        where, 'identification_indptr', tb.Int64Atom(), shape=(0,)
+    )
+    indices = hdf_file.create_earray(
+        where, 'identification_indices', tb.Int64Atom(), shape=(0,)
+    )
 
-    peptide_hit_num = 0
-    peptide_hit_groups = ident_run.findall('PeptideIdentification')
-    for i, peptide_hit_group in enumerate(peptide_hit_groups):
-        pos_id = i
-        mz = float(peptide_hit_group.get('MZ'))
-        rt = float(peptide_hit_group.get('RT'))
-        for peptide_hit in peptide_hit_group.findall('PeptideHit'):
-            seq = peptide_hit.get('sequence')
-            charge = int(peptide_hit.get('charge'))
-            score = float(peptide_hit.get('score'))
-            aa_before = peptide_hit.get('aa_before')
-            aa_after = peptide_hit.get('aa_after')
-            e_value = peptide_hit[0].get('value')
-            prot_refs = peptide_hit.get('protein_refs').split(' ')
-            for ref in prot_refs:
-                hit_to_prot.add((peptide_hit_num, int(ref[3:])))
-            peptide_hits.append([
-                (pos_id, mz, rt, charge, score, seq, aa_before,
-                 aa_after, e_value)
-            ])
-            peptide_hit_num += 1
-
-    m = sparse.dok_matrix((len(peptide_hits), len(proteins)), dtype=bool)
-    for i, j in hit_to_prot:
-        m[i, j] = True
-
-    m = m.tocsr()
-    hdf_file.create_array(where, 'identification_indptr', obj=m.indptr)
-    hdf_file.create_array(where, 'identification_indices', obj=m.indices)
+    for event, elem in iterparser:
+        if event == 'start' and elem.tag == 'ProteinIdentification':
+            write_proteins(iterparser, elem, proteins)
+            elem.clear()
+        elif event == 'start' and elem.tag == 'PeptideIdentification':
+            write_peptides(iterparser, elem, peptide_hits, indptr, indices)
+            elem.clear()
+            return
+        else:
+            raise ValueError('Reached unexpected tag: %s' % elem.tag)
 
 
 def parse_args():
@@ -103,21 +166,35 @@ def parse_args():
     parser.add_argument('--compress', choices=['blosc', 'zlib', 'lzo'],
                         default='zlib')
     parser.add_argument('--compression-level', choices=list(range(1, 10)),
-                        default=1)
+                        default=1, type=int)
+    parser.add_argument('--where', help='hdf5 destination inside output',
+                        default='/')
+    parser.add_argument('--no-run-group', action='store_false', default=True,
+                        help='Write the first IdentificationRun only and ' +
+                        'do not create a group for the run')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    infile = ET.parse(args.input)
-    root = infile.getroot()
+    infile = ET.iterparse(args.input, ['start', 'end'])
 
     filters = tb.Filters(complevel=args.compression_level,
                          complib=args.compress, fletcher32=True)
     f = tb.open_file(args.output, 'w')
     with contextlib.closing(f):
-        run_group = f.create_group('/', 'run000')
-        write_run(root[0], root[1], f, where=run_group, filters=filters)
+        run_id = 0
+        for event, elem in infile:
+            if event == 'start' and elem.tag == 'IdentificationRun':
+                if not args.no_run_group:
+                    run_group = f.create_group(
+                        args.where, 'run{:03}'.format(run_id)
+                    )
+                else:
+                    run_group = f.get_node(args.where)
+                write_run(infile, elem, f, where=run_group, filters=filters)
+                elem.clear()
+                run_id += 1
 
 if __name__ == '__main__':
     main()
