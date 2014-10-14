@@ -156,6 +156,49 @@ def write_run(iterparser, start_tag, hdf_file, where="/", filters=None):
             raise ValueError('Reached unexpected tag: %s' % elem.tag)
 
 
+def read_idXML(infile, storage, where='/', no_run_group=False, filters=None):
+    """ Read itXML and store the arrays in hdf storage.
+
+    Parameters
+    ----------
+    infile : path or file
+        Input idXML file to read
+    storage : path or pytables.File instance
+        The HDF5 file to store the tables in. If a path is specified the
+        file will be opened in append mode.
+    where : str or pytables.Group
+        The path in the HDF5 file to use
+    no_run_group : bool
+        If True, this function will create a seperate group for each run
+        in the idXML file.
+    filters : pytables.Filter
+        pytables.Filter instance (e.g. to specify compression)
+    """
+    def read_groups(storage_file):
+        if where not in storage_file:
+            storage_file.create_group('/', where.lstrip('/'))
+        run_id = 0
+        for event, elem in infile:
+            if event == 'start' and elem.tag == 'IdentificationRun':
+                if not no_run_group:
+                    run_group = f.create_group(
+                        where, 'run{:03}'.format(run_id)
+                    )
+                else:
+                    run_group = f.get_node(where)
+                write_run(infile, elem, f, where=run_group, filters=filters)
+                elem.clear()
+                run_id += 1
+
+    infile = ET.iterparse(infile, ['start', 'end'])
+    if isinstance(storage, tb.File):
+        read_groups(storage)
+    else:
+        f = tb.open_file(storage, 'a')
+        with contextlib.closing(f):
+            read_groups(f)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert an OpenMS idXML file to a hdf5 format"
@@ -177,24 +220,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    infile = ET.iterparse(args.input, ['start', 'end'])
-
     filters = tb.Filters(complevel=args.compression_level,
                          complib=args.compress, fletcher32=True)
-    f = tb.open_file(args.output, 'w')
-    with contextlib.closing(f):
-        run_id = 0
-        for event, elem in infile:
-            if event == 'start' and elem.tag == 'IdentificationRun':
-                if not args.no_run_group:
-                    run_group = f.create_group(
-                        args.where, 'run{:03}'.format(run_id)
-                    )
-                else:
-                    run_group = f.get_node(args.where)
-                write_run(infile, elem, f, where=run_group, filters=filters)
-                elem.clear()
-                run_id += 1
+    read_idXML(args.input, args.output, where=args.where,
+               no_run_group=args.no_run_group, filters=filters)
+
 
 if __name__ == '__main__':
     main()
