@@ -65,19 +65,6 @@ def convert_mzml(infile, storage, where='/'):
         f = h5py.File(storage, 'a')
         with contextlib.closing(f):
             read_groups(f)
-Quoting Hannes Röst <hannesroest@gmail.com>:
-
-> Hi Adrian
->
-> Wie versprochen noch der Link zu der Doku fuer den file access
-> http://ftp.mi.fu-berlin.de/OpenMS/documentation/html/tutorial_format.html
-> und als Anhang noch das chapter meiner thesis das ich gerade dazu
-> schreibe. Bin gespannt von dir zu hoeren wenn es Neuigkeiten zu hdf5
-> gibt.
->
-> Beste Gruesse
->
-> Hannes
 
 
 def parse_args():
